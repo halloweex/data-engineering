@@ -1,54 +1,37 @@
-from pyspark.sql import SparkSession
+import sys
+import re
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+
 from pyspark.sql.functions import when, col, regexp_extract, coalesce, split, udf, regexp_replace, lit, lower, count
 from pyspark.sql.types import IntegerType, StringType
-import re
 
-# Start Spark session
-spark = SparkSession.builder.getOrCreate()
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
 
-# Read the CSV file
-df = spark.read.option("delimiter", ",") \
-    .option("quote", "\"") \
-    .option("multiLine", True) \
-    .option("escape", "\"") \
-    .csv("/Users/vladislav/Documents/glue-project/raw_data/csv/dataengineer/DataEngineer.csv",
-         header=True, inferSchema=True)
+# Script generated for node Amazon S3
+S3_input_parquet = glueContext.create_dynamic_frame.from_options(
+    format_options={},
+    connection_type="s3",
+    format="parquet",
+    connection_options={
+        "paths": ["s3://vladislav-initial-s3/data/raw_data_parquet/dataengineer/"],
+        "recurse": True,
+    },
+    transformation_ctx="S3_input_parquet",
+)
 
-# Show initial data
+df = S3_input_parquet.toDF()
 
-columns_renaming = {
-    "location": "job_location",
-    "size": "company_size",
-    "industry": "company_industry",
-    "sector": "company_sector",
-    "revenue": "company_revenue",
-    "company name": "company_name",
-    "job description": "job_description",
-    "job title": "job_title",
-    "salary estimate": "salary_estimate",
-    "headquarters": "headquarters",
-    "easy apply": "easy_apply",
-    "type of ownership": "type_of_ownership",
-}
 
-for old_col, new_col in columns_renaming.items():
-    df = df.withColumnRenamed(old_col, new_col)
-
-# Replace "-1"
-df = df.withColumn("Founded", when(col("Founded") == -1, lit(None)).otherwise(col("Founded")))
-df = df.withColumn("easy_apply", when(col("easy_apply") == -1, lit(None)).otherwise(col("easy_apply")))
-df = df.withColumn("company_industry",
-                   when(col("company_industry") == "-1", "Unknown").otherwise(col("company_industry")))
-df = df.withColumn("company_size", when(col("company_size") == "-1", "Unknown").otherwise(col("company_size")))
-df = df.withColumn("company_sector", when(col("company_sector") == "-1", "Unknown").otherwise(col("company_sector")))
-df = df.withColumn("company_revenue", when(col("company_revenue") == "-1", "Unknown").otherwise(col("company_revenue")))
-df = df.withColumn("Competitors", when(col("Competitors") == "-1", "Unknown").otherwise(col("Competitors")))
-df = df.withColumn("type_of_ownership",
-                   when(col("type_of_ownership") == "-1", "Unknown").otherwise(col("type_of_ownership")))
-
-df.show()
-
-# Dictionary mapping number words to their numeric representations
 number_word_to_num = {
     'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5',
     'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10',
@@ -57,7 +40,7 @@ number_word_to_num = {
     'nineteen': '19', 'twenty': '20'
 }
 
-
+# Function to replace number words with numbers
 def replace_number_words(text):
     def replace_match(match):
         word = match.group(0)
@@ -67,16 +50,18 @@ def replace_number_words(text):
     pattern = r'\b(' + '|'.join(re.escape(key) for key in number_word_to_num.keys()) + r')\b'
     return re.sub(pattern, replace_match, text)
 
-
 # Create a UDF from the function
 # Apply the UDF to the DataFrame
 replace_number_words_udf = udf(replace_number_words, StringType())
 df = df.withColumn('job_description', replace_number_words_udf(col('job_description')))
 
-# Remove ratings from the 'company_name' column
+
+# Remove ratings from the 'company name' column
 # This regex looks for a newline followed by any number of characters (.*)
 df = df.withColumn('company_name', regexp_replace('company_name', '\\n.*', ''))
 
+
+# Define the regex pattern to extract job experience
 experience_pattern = (
     r'\b(\d+)'  # Capture an initial numeric value
     r'(\s*-\s*\d+)?'  # Optionally capture a range (' - ' followed by another number)
@@ -88,7 +73,6 @@ experience_pattern = (
 
 # Apply this pattern in your existing PySpark script:
 df = df.withColumn('job_experience', regexp_extract(col('job_description'), experience_pattern, 1))
-
 
 def extract_min_exp(exp_range):
     if exp_range:
@@ -104,15 +88,12 @@ extract_min_experience_udf = udf(extract_min_exp, IntegerType())
 df = df.withColumn('min_years_experience',
                    extract_min_experience_udf(regexp_extract(col('job_description'), experience_pattern, 0)))
 
-# Count the number of nulls in 'job_experience_yrs'
-null_count = \
-    df.agg(count(when(col('job_experience').isNull() | (col('job_experience') == ''), True))).collect()[0][0]
-print(f"Number of nulls in 'job_experience': {null_count}")
+
 
 # Check if languages is mentioned in the job description and create a new column 'python'
 languages = ['python', 'scala', 'java', 'sql']
 for language in languages:
-    df = df.withColumn(language, col('job_description').contains(language))
+    df = df.withColumn(language, lower(col('job_description')).contains(language))
 
 # Define a regular expression pattern for AWS and Amazon Web Services with word boundaries
 aws_pattern = r'\b(aws|amazon web services)\b'
@@ -129,28 +110,20 @@ df = df.withColumn('gcp', when(
     lower(col('job_description')).contains('gcp') | lower(col('job_description')).contains('google cloud platform'),
     True).otherwise(False))
 
+def extract_salary(value, position):
+    try:
+        # Remove '$' and 'K', then split by '-' and get the part based on position
+        salary_part = value.replace('$', '').replace('K', '').split('-')[position].split('(')[0].strip()
+        return int(salary_part) * 1000
+    except:
+        return None
 
 # Define UDFs for extracting min and max salaries
-def extract_min_salary(value):
-    try:
-        return int(value.split('-')[0].replace('$', '').replace('K', '').strip()) * 1000
-    except:
-        return None
-
-
-def extract_max_salary(value):
-    try:
-        return int(value.split('-')[1].split('(')[0].replace('$', '').replace('K', '').strip()) * 1000
-    except:
-        return None
-
-
-extract_min_salary_udf = udf(extract_min_salary, IntegerType())
-extract_max_salary_udf = udf(extract_max_salary, IntegerType())
+extract_salary_udf = udf(lambda value, pos: extract_salary(value, pos), IntegerType())
 
 # Create new columns with min, max, avg salary for each row
-df = df.withColumn("min_salary", extract_min_salary_udf("salary_estimate"))
-df = df.withColumn("max_salary", extract_max_salary_udf("salary_estimate"))
+df = df.withColumn("min_salary", extract_salary_udf("salary_estimate", lit(0)))
+df = df.withColumn("max_salary", extract_salary_udf("salary_estimate", lit(1)))
 df = df.withColumn("avg_salary", (col("min_salary") + col("max_salary")) / 2)
 
 # Regular expression for job levels
@@ -201,4 +174,51 @@ df = df.withColumn(
     .otherwise(False)
 )
 
-df.show()
+df_final = df.select('job_title',
+'salary_estimate',
+'rating',
+'company_name',
+'location',
+'headquarters',
+'size',
+'founded',
+'type_of_ownership',
+'industry',
+'sector',
+'revenue',
+'competitors',
+'easy_apply',
+'source_date',
+'job_experience',
+'min_years_experience',
+'python',
+'scala',
+'java',
+'sql',
+'aws',
+'azure',
+'gcp',
+'min_salary',
+'max_salary',
+'avg_salary',
+    'job_level',
+'is_remote',
+'is_relocation')
+
+S3_input_parquet = DynamicFrame.fromDF(df_final, glueContext, "S3_input_parquet")
+
+# Script generated for node Amazon S3
+S3_output_parquet = glueContext.getSink(
+    path="s3://vladislav-initial-s3/data/output_data_parquet/dataengineer/",
+    connection_type="s3",
+    updateBehavior="UPDATE_IN_DATABASE",
+    partitionKeys=[],
+    enableUpdateCatalog=True,
+    transformation_ctx="AmazonS3_output_data_parquet",
+)
+S3_output_parquet.setCatalogInfo(
+    catalogDatabase="de_project_db", catalogTableName="output_table_dataengineer"
+)
+S3_output_parquet.setFormat("glueparquet", compression="snappy")
+S3_output_parquet.writeFrame(S3_input_parquet)
+job.commit()
